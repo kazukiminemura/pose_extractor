@@ -1,0 +1,28 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Videos and outputs
+*.mp4
+*.avi
+out.*
+
+# Models and exports
+*.pt
+*.onnx
+*.engine
+*.bin
+*.xml
+yolov8n-pose_openvino_model/
+
+# Notebooks checkpoints
+.ipynb_checkpoints/

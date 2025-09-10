@@ -1,20 +1,31 @@
 import argparse
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, Tuple
 
 import cv2
+import numpy as np
 import torch
 
-# Ultralytics helpers for OpenVINO-direct path
+# Ultralytics helpers (optional)
 try:
     from ultralytics.nn.autobackend import AutoBackend  # type: ignore
     from ultralytics.data.augment import LetterBox  # type: ignore
     from ultralytics.utils import nms, ops  # type: ignore
     from ultralytics.engine.results import Results  # type: ignore
 except Exception:
-    # Optional; only required if using OpenVINO-direct fallback
     AutoBackend = None  # type: ignore
+    LetterBox = None  # type: ignore
+    nms = None  # type: ignore
+    ops = None  # type: ignore
+    Results = None  # type: ignore
+
+try:
+    import openvino as ov  # modern API
+except Exception:
+    ov = None  # type: ignore
 
 
 def _try_import_ultralytics():
@@ -22,40 +33,32 @@ def _try_import_ultralytics():
         from ultralytics import YOLO  # type: ignore
         return YOLO
     except Exception as e:
-        print("[ERROR] ultralytics が見つかりません。'pip install ultralytics opencv-python' を実行してください。", file=sys.stderr)
+        print("[ERROR] ultralytics が見つかりません。'pip install ultralytics opencv-python' を実行してください", file=sys.stderr)
         raise e
 
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="YOLOv8-Pose で動画を解析して描画 (Ultralytics / OpenVINO)"
-    )
+    p = argparse.ArgumentParser(description="YOLOv8-Pose 推論 (Ultralytics / OpenVINO)")
     p.add_argument("--source", type=str, required=True, help="入力: 動画パス or カメラID(例: 0)")
     p.add_argument(
         "--engine",
         type=str,
         default="ultralytics",
-        choices=["ultralytics", "openvino"],
-        help="推論エンジンを選択"
+        choices=["ultralytics", "openvino", "ov"],
+        help="推論エンジン: 'ultralytics' | 'openvino'(Ultralytics-OV) | 'ov'(OpenVINO Runtime)",
     )
-    p.add_argument(
-        "--model",
-        type=str,
-        default="yolov8n-pose.pt",
-        help="モデルパス (.pt もしくは OpenVINO の .xml)"
-    )
+    p.add_argument("--model", type=str, default="yolov8n-pose.pt", help="モデルファイル (.pt or .xml / OpenVINO ディレクトリ)")
     p.add_argument("--device", type=str, default="cpu", help="デバイス: cpu / cuda:0 / AUTO / GPU など")
     p.add_argument("--imgsz", type=int, default=640, help="推論解像度")
-    p.add_argument("--show", action="store_true", help="ウィンドウに表示")
+    p.add_argument("--show", action="store_true", help="ウィンドウ表示")
     p.add_argument("--save", type=str, default=None, help="出力動画パス (.mp4 / .avi)")
     p.add_argument("--export_only", action="store_true", help="OpenVINO へのエクスポートのみ実行")
-    p.add_argument("--no_annot", action="store_true", help="描画を無効化 (計測のみ)")
+    p.add_argument("--no_annot", action="store_true", help="描画を無効 (計測のみ)")
     p.add_argument("--max_frames", type=int, default=0, help="処理フレーム上限 (0 で無制限)")
     return p.parse_args()
 
 
 def is_camera_source(src: str) -> bool:
-    # 数字のみならカメラIDとみなす
     try:
         int(src)
         return True
@@ -72,7 +75,7 @@ def _fourcc_for_path(path: str):
 
 def ensure_openvino_model(pt_or_xml: str, imgsz: int = 640) -> Path:
     """
-    .pt が指定された場合、未変換なら OpenVINO へエクスポート。
+    .pt が指定された場合、未変換なら OpenVINO へエクスポートして返す。
     返り値は OpenVINO ディレクトリ or .xml のパス。
     .xml 指定ならそのまま返す。
     """
@@ -82,15 +85,13 @@ def ensure_openvino_model(pt_or_xml: str, imgsz: int = 640) -> Path:
 
     YOLO = _try_import_ultralytics()
 
-    # 既にエクスポート済みかを緩く探索（ディレクトリ or .xml）
+    # 既にエクスポート済みの可能性
     export_dir = src.with_name(f"{src.stem}_openvino_model")
     if export_dir.exists() and export_dir.is_dir():
-        # ディレクトリ内に .xml があれば OK（ファイル名はバージョンで変わる可能性あり）
         xmls = list(export_dir.glob("*.xml"))
         if xmls:
             return export_dir
     else:
-        # 直近に既に *.xml が存在していないかも一応チェック
         candidate_xml = src.with_suffix("").with_name(f"{src.stem}_openvino_model.xml")
         if candidate_xml.exists():
             return candidate_xml
@@ -98,34 +99,59 @@ def ensure_openvino_model(pt_or_xml: str, imgsz: int = 640) -> Path:
     print(f"[INFO] OpenVINO にエクスポートします: {src} -> {export_dir}")
     model = YOLO(str(src))
     out = model.export(format="openvino", imgsz=imgsz)
-    # Ultralytics は export の返り値にパス（ディレクトリ or .xml）を返す
     out_path = Path(out)
     if out_path.is_dir():
-        # ディレクトリ内の .xml を検出できればディレクトリを返す
         if list(out_path.glob("*.xml")):
             return out_path
     elif out_path.suffix.lower() == ".xml":
         return out_path
-
-    # フォールバック: 想定ディレクトリ内の .xml を総当たり
-    if export_dir.exists() and export_dir.is_dir():
-        if list(export_dir.glob("*.xml")):
-            return export_dir
-
-    raise RuntimeError("OpenVINO エクスポートに失敗しました。出力内に .xml が見つかりません。")
+    if export_dir.exists() and export_dir.is_dir() and list(export_dir.glob("*.xml")):
+        return export_dir
+    raise RuntimeError("OpenVINO エクスポートに失敗しました。出力先に .xml が見つかりません")
 
 
-def _normalize_ov_device(device: str) -> str:
+def _normalize_ov_device_ultra(device: str) -> str:
     d = (device or "").strip().upper()
-    # Allow Intel NPU too
     if d in {"CPU", "GPU", "NPU", "AUTO"}:
         return f"intel:{d}"
-    # default AUTO
     return "intel:AUTO"
 
 
+def _normalize_ov_device_rt(device: str) -> str:
+    d = (device or "").strip().upper()
+    if any(x in d for x in ("CUDA", "CUDA:0", "CUDA:1")):
+        return "AUTO"
+    if d.startswith("INTEL:"):
+        d = d.split(":", 1)[-1]
+    if d in {"CPU", "GPU", "AUTO", "NPU"}:
+        return d
+    if d.startswith("GPU"):
+        return "GPU"
+    return "AUTO"
+
+
+def _first_xml_path(p: Path) -> Path:
+    if p.is_file() and p.suffix.lower() == ".xml":
+        return p
+    if p.is_dir():
+        xs = sorted(p.glob("*.xml"))
+        if xs:
+            return xs[0]
+    raise FileNotFoundError(f"OpenVINO XML が見つかりません: {p}")
+
+
+@dataclass
+class OVRuntimeModel:
+    compiled: Any
+    input_shape: Tuple[int, int]
+    names: Dict[int, str]
+    kpt_shape: Tuple[int, int] = (17, 3)
+    fp16: bool = False
+    device: str = "AUTO"
+
+
 def _predict_openvino_direct(model: "AutoBackend", frame, imgsz: int):
-    # Preprocess (match BasePredictor.preprocess)
+    # Preprocess (align with Ultralytics BasePredictor)
     im0 = frame
     lb = LetterBox(imgsz, auto=False, stride=getattr(model, "stride", 32))
     im = lb(image=im0)
@@ -156,9 +182,7 @@ def _predict_openvino_direct(model: "AutoBackend", frame, imgsz: int):
 
     pred = preds[0]
     if pred.shape[0]:
-        # Scale boxes
         ops.scale_boxes(im.shape[2:], pred[:, :4], im0.shape)
-        # Keypoints for pose: reshape and scale
         if hasattr(model, "kpt_shape") and pred.shape[1] >= 6 + (model.kpt_shape[0] * model.kpt_shape[1]):
             kpts = pred[:, 6:].view(len(pred), *model.kpt_shape)
             kpts = ops.scale_coords(im.shape[2:], kpts, im0.shape)
@@ -167,7 +191,72 @@ def _predict_openvino_direct(model: "AutoBackend", frame, imgsz: int):
     else:
         kpts = None
 
-    # Build Results for plotting API compatibility
+    res = Results(
+        orig_img=im0,
+        path="",
+        names=model.names,
+        boxes=pred[:, :6] if pred.shape[0] else None,
+        keypoints=kpts if kpts is not None and pred.shape[0] else None,
+    )
+    return res
+
+
+def _predict_openvino_rt(model: OVRuntimeModel, frame, imgsz: int):
+    """Native OpenVINO Runtime inference with Ultralytics-style postprocess (NMS + KP scaling)."""
+    if LetterBox is None or ops is None or Results is None or nms is None:
+        raise RuntimeError("Ultralytics の補助モジュールが必要です (LetterBox/ops/nms/Results)")
+
+    im0 = frame
+    lb = LetterBox(imgsz, auto=False, stride=32)
+    im = lb(image=im0)
+    if im.shape[-1] == 3:
+        im = im[..., ::-1]  # BGR -> RGB
+    im = im.transpose(2, 0, 1).astype(np.float32)  # HWC -> CHW
+    im = np.expand_dims(im, 0)
+    im /= 255.0
+
+    # Inference (OpenVINO Runtime)
+    outputs = model.compiled([im])  # type: ignore
+    if isinstance(outputs, (list, tuple)):
+        out = outputs[0]
+    else:
+        try:
+            out = next(iter(outputs.values()))  # type: ignore[attr-defined]
+        except Exception:
+            out = outputs
+
+    # out is expected as (B, no, N) e.g., (1, 56, 8400)
+    if out.ndim == 2:  # add batch dim if squeezed
+        out = np.expand_dims(out, 0)
+    if out.ndim != 3:
+        raise RuntimeError(f"OpenVINO 出力の形状が想定外です: {out.shape}")
+
+    preds = torch.from_numpy(out)  # (B, no, N)
+    preds = nms.non_max_suppression(
+        preds,
+        conf_thres=0.25,
+        iou_thres=0.45,
+        classes=None,
+        agnostic=False,
+        max_det=300,
+        nc=len(model.names),
+        end2end=False,
+        rotated=False,
+    )
+
+    pred = preds[0]
+    if pred.shape[0]:
+        ops.scale_boxes((imgsz, imgsz), pred[:, :4], im0.shape)
+        total = pred.shape[1]
+        expected = 6 + (model.kpt_shape[0] * model.kpt_shape[1])
+        if total >= expected:
+            kpts = pred[:, 6:6 + model.kpt_shape[0] * model.kpt_shape[1]].view(len(pred), *model.kpt_shape)
+            kpts = ops.scale_coords((imgsz, imgsz), kpts, im0.shape)
+        else:
+            kpts = None
+    else:
+        kpts = None
+
     res = Results(
         orig_img=im0,
         path="",
@@ -185,21 +274,35 @@ def load_model(engine: str, model_path: str, imgsz: int, device: str):
         backend = "Ultralytics"
         return model, backend
 
-    # OpenVINO: use AutoBackend directly to allow Intel GPU selection
     xml_or_dir = ensure_openvino_model(model_path, imgsz=imgsz)
-    if AutoBackend is None:
-        raise RuntimeError("ultralytics の内部モジュール読み込みに失敗しました。")
-    ov_device = _normalize_ov_device(device)
-    model = AutoBackend(str(xml_or_dir), device=ov_device, fp16=False, fuse=True, verbose=True)
-    backend = "OpenVINO"
-    return model, backend
+
+    if engine == "openvino":
+        if AutoBackend is None:
+            raise RuntimeError("Ultralytics の AutoBackend が利用できません")
+        ov_device = _normalize_ov_device_ultra(device)
+        model = AutoBackend(str(xml_or_dir), device=ov_device, fp16=False, fuse=True, verbose=True)
+        backend = "OpenVINO (Ultralytics)"
+        return model, backend
+
+    if engine == "ov":
+        if ov is None:
+            raise RuntimeError("openvino パッケージが見つかりません。'pip install openvino' を実行してください")
+        core = ov.Core()
+        xml_path = _first_xml_path(Path(xml_or_dir))
+        device_rt = _normalize_ov_device_rt(device)
+        compiled = core.compile_model(xml_path.as_posix(), device_rt)
+        names = {0: 'person'}  # YOLOv8 Pose は 1 クラス(person)
+        model = OVRuntimeModel(compiled=compiled, input_shape=(imgsz, imgsz), names=names, kpt_shape=(17, 3), fp16=False, device=device_rt)
+        backend = "OpenVINO Runtime"
+        return model, backend
+
+    raise ValueError(f"未知のエンジン指定です: {engine}")
 
 
 def main():
     args = parse_args()
 
-    if args.engine == "openvino" and args.export_only:
-        # エクスポートのみ
+    if args.engine in ("openvino", "ov") and args.export_only:
         ensure_openvino_model(args.model, imgsz=args.imgsz)
         print("[DONE] OpenVINO へのエクスポート完了")
         return
@@ -213,7 +316,7 @@ def main():
         sys.exit(1)
 
     # 入出力情報
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0
     if not fps or fps <= 0:
         fps = 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -227,14 +330,13 @@ def main():
             print(f"[WARN] 出力ファイルを開けませんでした: {args.save}")
             writer = None
 
-    # モデルロード
+    # モデルの読み込み
     model, backend = load_model(args.engine, args.model, imgsz=args.imgsz, device=args.device)
 
     frame_idx = 0
-    t_prev = time.time()
     smoothed_fps = fps
 
-    print(f"[INFO] 開始: {backend} / model={args.model} / device={args.device}")
+    print(f"[INFO] Start: {backend} / model={args.model} / device={args.device}")
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -242,9 +344,14 @@ def main():
 
         t0 = time.time()
 
+        if args.no_annot:
+            annotated = frame
+
         if args.engine == "openvino":
-            # OpenVINO-direct path
             result = _predict_openvino_direct(model, frame, imgsz=args.imgsz)
+            annotated = result.plot() if not args.no_annot else frame
+        elif args.engine == "ov":
+            result = _predict_openvino_rt(model, frame, imgsz=args.imgsz)
             annotated = result.plot() if not args.no_annot else frame
         else:
             # Ultralytics default path
@@ -252,7 +359,7 @@ def main():
             result = results[0]
             annotated = result.plot() if not args.no_annot else frame
 
-        # オーバーレイ情報
+        # Overlay
         dt = time.time() - t0
         inst_fps = 1.0 / max(dt, 1e-6)
         smoothed_fps = smoothed_fps * 0.9 + inst_fps * 0.1
@@ -284,3 +391,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
